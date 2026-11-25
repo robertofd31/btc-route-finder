@@ -255,6 +255,7 @@ export const DUMMY_BTC = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
 
 export const DAPP_LINKS = {
   garden: "https://app.garden.finance/",
+  jumper: "https://jumper.exchange/",
   threshold: "https://app.threshold.network/",
   nearIntents: "https://app.near-intents.org/",
   across: "https://app.across.to/",

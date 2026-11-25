@@ -18,14 +18,15 @@ Panel web estático y gratuito (sin backend ni claves de API) para encontrar en 
 - **BNB Chain (BSC):** `BTCB`, `LBTC`
 
 ## Protocolos y rutas comparadas en tiempo real
-1. **Garden Finance** — Atomic swaps HTLC directos (`arbitrum:wbtc`, `base:cbbtc`, `ethereum:wbtc/cbbtc`, `bnbchain:btcb`) + **ruta optimizada `Across → Base cbBTC → Garden (9 bps)`**.
-2. **Threshold Network (`tBTC`)** — Redención directa 1:1 descentralizada (`0,20%` protocolo + mempool BTC) desde Arbitrum, Ethereum, Base, Optimism y Polygon.
-3. **NEAR Intents (1Click)** — Red de *solvers* directos o vía USDC en las 7 redes.
-4. **THORChain Streaming Swaps** — Con detección automática en vivo de pausas Mimir (`HALTBTCTRADING`, etc.).
-5. **Chainflip (JIT AMM + DCA)** — Con detección automática de mantenimiento.
-6. **Symbiosis Finance** — Salida directa en 1 firma EVM → Bitcoin.
-7. **Lombard / Core (`BTC.b` / `LBTC`)** — Redención de tarifa fija `0.0001 BTC` sin comisión porcentual.
-8. **Maya Protocol** — Con comprobación de liquidez en vivo.
+1. **Garden Finance** — Atomic swaps HTLC directos (`arbitrum:wbtc`, `base:cbbtc`, `ethereum:wbtc/cbbtc`) + **ruta optimizada `Across → Base cbBTC → Garden (9 bps)`**.
+2. **Jumper / LI.FI** — Agregador cross-chain en vivo (`Relay`, `NearIntents`, `Layerswap`, etc.) tanto directo en 1 clic como optimizado vía USDC.
+3. **Threshold Network (`tBTC`)** — Redención directa 1:1 descentralizada (`0,20%` protocolo + mempool BTC) desde Arbitrum, Ethereum, Base, Optimism y Polygon.
+4. **NEAR Intents (1Click)** — Red de *solvers* directos o vía USDC en las 7 redes.
+5. **THORChain Streaming Swaps** — Con detección automática en vivo de pausas Mimir (`HALTBTCTRADING`, etc.).
+6. **Chainflip (JIT AMM + DCA)** — Con detección automática de mantenimiento.
+7. **Symbiosis Finance** — Salida directa en 1 firma EVM → Bitcoin.
+8. **Lombard / Core (`BTC.b` / `LBTC`)** — Redención de tarifa fija `0.0001 BTC` sin comisión porcentual.
+9. **Maya Protocol** — Con comprobación de liquidez en vivo.
 
 ## Telemetría y extras incluidos
 - Precio BTC spot y prima/descuento real del activo origen (**DefiLlama**).

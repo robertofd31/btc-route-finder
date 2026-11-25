@@ -261,6 +261,41 @@ async function quoteChainflip(srcChain, srcAsset, amountRaw) {
 }
 
 /**
+ * Jumper / LI.FI advanced routes quote (returns live routes via Relay, NearIntents, Layerswap, etc.)
+ */
+async function quoteLiFiRoutes(fromChainId, fromTokenAddress, fromAmountRaw) {
+  const payload = {
+    fromChainId,
+    toChainId: 20000000000001, // Bitcoin UTXO on LI.FI
+    fromTokenAddress,
+    toTokenAddress: "bitcoin",
+    fromAmount: String(fromAmountRaw),
+    fromAddress: DUMMY_EVM,
+    toAddress: DUMMY_BTC,
+  };
+  const res = await fetchJson("https://li.quest/v1/advanced/routes", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok || !Array.isArray(res.data?.routes) || !res.data.routes.length) {
+    return { ok: false, error: res.data?.message || res.error || `Sin rutas LI.FI (HTTP ${res.status})` };
+  }
+  const routes = res.data.routes.map((rt) => {
+    const tools = (rt.steps || []).map((s) => s.toolDetails?.name || s.tool).filter(Boolean);
+    const totalSec = (rt.steps || []).reduce((acc, s) => acc + (s.estimate?.executionDuration || 0), 0);
+    return {
+      btcOut: fromBaseUnits(rt.toAmount, 8),
+      tools: tools.join(" + ") || "LI.FI",
+      timeSec: totalSec || 600,
+      tags: rt.tags || [],
+    };
+  });
+  routes.sort((a, b) => b.btcOut - a.btcOut);
+  return { ok: true, best: routes[0], all: routes };
+}
+
+/**
  * Maya Protocol Quote
  */
 async function quoteMaya(fromAsset, amount1e8) {
@@ -288,6 +323,8 @@ export async function findBestRoutes({
   telemetry,
   sharedMimir = null,
   includeSymbiosis = true,
+  includeJumper = true,
+  includeJumperUsdc = true,
   includeCrossChainHops = true,
 }) {
   const chain = CHAINS[chainId];
@@ -300,6 +337,7 @@ export async function findBestRoutes({
   const unavailable = [];
   const protocolHealth = {
     Garden: { state: "unknown", label: "Garden" },
+    Jumper: { state: "unknown", label: "Jumper / LI.FI" },
     Threshold: { state: "ok", label: "Threshold tBTC" },
     NEAR: { state: "unknown", label: "NEAR Intents" },
     THORChain: { state: "unknown", label: "THORChain" },
@@ -1069,7 +1107,87 @@ export async function findBestRoutes({
   }
 
   // =========================================================================
-  // ROUTE 10: MAYA PROTOCOL (Arbitrum / Ethereum direct WBTC check)
+  // ROUTE 10: JUMPER / LI.FI AGGREGATOR (Direct + via USDC if better)
+  // =========================================================================
+  if (includeJumper) {
+    tasks.push((async () => {
+      const directQ = await quoteLiFiRoutes(chain.chainId, token.address, amountRaw);
+      let usdcQ = { ok: false };
+      if (includeJumperUsdc && usdcDex?.ok) {
+        await new Promise((res) => setTimeout(res, 350));
+        usdcQ = await quoteLiFiRoutes(chain.chainId, chain.usdc.address, usdcDex.amountOutRaw);
+      }
+
+      if (directQ.ok) {
+        protocolHealth.Jumper = { state: "ok", label: `Jumper / LI.FI (${directQ.best.tools})` };
+        const best = directQ.best;
+        const mins = Math.max(3, Math.round(best.timeSec / 60));
+        const altProviders = directQ.all.slice(1, 3).map((x) => `${x.tools}: ${(x.btcOut * tranches).toFixed(6)} BTC`).join(" · ");
+        addRoute({
+          id: `${chainId}-${token.symbol}-jumper-direct`,
+          name: `Jumper / LI.FI Directo vía ${best.tools} (${chain.name} ${token.symbol})`,
+          protocol: "Jumper / LI.FI",
+          model: `Agregador LI.FI (${best.tools})`,
+          btcOutPerTx: best.btcOut,
+          etaMinutes: mins,
+          etaLabel: `~${mins} min`,
+          stepsCount: 1,
+          usdExposure: false,
+          tags: ["1 solo clic", `vía ${best.tools}`, "0% exposición USD", "Agregador LI.FI"],
+          note: `Cotización real de Jumper (LI.FI) en 1 paso usando ${best.tools}.${altProviders ? ` Otras rutas en Jumper: ${altProviders}.` : ""}`,
+          steps: [
+            {
+              text: `Abre Jumper Exchange, selecciona ${token.symbol} (${chain.name}) → Bitcoin (BTC), elige la ruta ${best.tools} y pega tu dirección bc1q.../bc1p...`,
+              linkLabel: "Abrir Jumper (LI.FI)",
+              linkUrl: DAPP_LINKS.jumper,
+            },
+          ],
+        });
+      }
+
+      if (usdcQ.ok && (!directQ.ok || usdcQ.best.btcOut > directQ.best.btcOut * 1.0005)) {
+        if (protocolHealth.Jumper.state === "unknown") {
+          protocolHealth.Jumper = { state: "ok", label: `Jumper / LI.FI (${usdcQ.best.tools})` };
+        }
+        const best = usdcQ.best;
+        const mins = Math.max(4, Math.round(best.timeSec / 60) + 1);
+        const altProviders = usdcQ.all.slice(1, 3).map((x) => `${x.tools}: ${(x.btcOut * tranches).toFixed(6)} BTC`).join(" · ");
+        addRoute({
+          id: `${chainId}-${token.symbol}-jumper-usdc`,
+          name: `DEX (${token.symbol} → USDC) → Jumper / LI.FI vía ${best.tools}`,
+          protocol: "Jumper / LI.FI",
+          model: `DEX + LI.FI (${best.tools})`,
+          btcOutPerTx: best.btcOut,
+          etaMinutes: mins,
+          etaLabel: `~${mins} min`,
+          stepsCount: 2,
+          usdExposure: true,
+          tags: [`vía ${best.tools}`, "Agregador LI.FI", "Mejora al directo"],
+          note: `Cambiar primero a USDC en ${chain.name} desbloquea mejor precio en Jumper (${best.tools}).${altProviders ? ` Alternativas en Jumper: ${altProviders}.` : ""}`,
+          steps: [
+            {
+              text: `Cambia ${amountPerTx.toFixed(6)} ${token.symbol} → ~${usdcDex.amountOut.toFixed(2)} USDC en ${chain.name}.`,
+              linkLabel: "Abrir DefiLlama Swap",
+              linkUrl: DAPP_LINKS.defiLlamaSwap,
+            },
+            {
+              text: `En Jumper Exchange selecciona USDC (${chain.name}) → Bitcoin (BTC) con la ruta ${best.tools} hacia tu bc1q.../bc1p...`,
+              linkLabel: "Abrir Jumper (LI.FI)",
+              linkUrl: DAPP_LINKS.jumper,
+            },
+          ],
+        });
+      }
+
+      if (!directQ.ok && !usdcQ.ok) {
+        protocolHealth.Jumper = { state: "warn", label: "Jumper / LI.FI (sin ruta)" };
+        unavailable.push({ name: "Jumper / LI.FI", reason: directQ.error });
+      }
+    })());
+  }
+
+  // =========================================================================
+  // ROUTE 11: MAYA PROTOCOL (Arbitrum / Ethereum direct WBTC check)
   // =========================================================================
   if (token.mayaAsset) {
     tasks.push((async () => {
@@ -1150,7 +1268,9 @@ export async function findBestRoutesGlobal({ tokenFilter = "ALL", totalAmountBtc
         tranches,
         telemetry,
         sharedMimir,
-        includeSymbiosis: false, // Avoid 429 rate-limit burst across 10 parallel requests
+        includeSymbiosis: false,
+        includeJumper: true,
+        includeJumperUsdc: false,
         includeCrossChainHops: true,
       })
     )
