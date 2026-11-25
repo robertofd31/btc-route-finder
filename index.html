@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BTC Route Finder — Mejor Ruta DeFi (Sin KYC) a Bitcoin Nativo</title>
+  <meta name="description" content="Comparador en tiempo real 100% No-KYC para convertir activos sintéticos de BTC (WBTC, cbBTC, tBTC, BTC.b, BTCB, LBTC, kBTC) en 7 redes EVM a Bitcoin nativo al menor coste total." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="bg-glow"></div>
+
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <div class="brand">
+        <div class="brand-logo">₿</div>
+        <div>
+          <h1>BTC Route Finder</h1>
+          <p class="subtitle">Comparador DeFi en vivo · 100% No-KYC · Multi-red → Bitcoin L1</p>
+        </div>
+      </div>
+
+      <div class="telemetry-strip" id="telemetry-strip">
+        <div class="tele-item">
+          <span class="tele-label">BTC Spot</span>
+          <span class="tele-value mono" id="tele-btc-price">—</span>
+        </div>
+        <div class="tele-item">
+          <span class="tele-label">Activo origen</span>
+          <span class="tele-value mono" id="tele-src-peg">—</span>
+        </div>
+        <div class="tele-item">
+          <span class="tele-label">Mempool BTC</span>
+          <span class="tele-value mono" id="tele-mempool">—</span>
+        </div>
+        <div class="tele-item">
+          <span class="tele-label">Actualizado</span>
+          <span class="tele-value mono" id="tele-updated">—</span>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main class="container main-grid">
+    <!-- Control Panel -->
+    <section class="panel control-panel">
+      <div class="panel-header">
+        <h2>Configura tu traspaso</h2>
+        <span class="badge badge-nokyc">🔒 100% No-KYC · Solo DeFi</span>
+      </div>
+
+      <div class="controls-grid">
+        <!-- Chain Selector -->
+        <div class="field">
+          <label for="chain-select">1. Red de origen</label>
+          <div class="chain-pills" id="chain-pills"></div>
+        </div>
+
+        <!-- Token Selector -->
+        <div class="field">
+          <label for="token-select">2. Activo sintético BTC</label>
+          <div class="token-pills" id="token-pills"></div>
+          <div class="contract-bar" id="contract-bar">
+            <span class="contract-label">Contrato verificado:</span>
+            <code class="mono" id="contract-addr">—</code>
+            <button type="button" class="btn-icon" id="btn-copy-contract" title="Copiar contrato">Copiar</button>
+          </div>
+        </div>
+
+        <!-- Amount Input -->
+        <div class="field amount-field">
+          <div class="label-row">
+            <label for="amount-input">3. Importe a convertir</label>
+            <div class="unit-toggle" role="group" aria-label="Unidad">
+              <button type="button" class="unit-btn active" data-unit="USD">USD ($)</button>
+              <button type="button" class="unit-btn" data-unit="BTC">BTC</button>
+            </div>
+          </div>
+
+          <div class="amount-input-wrap">
+            <span class="amount-prefix mono" id="amount-prefix">$</span>
+            <input type="number" id="amount-input" class="mono" value="20000" min="50" step="any" />
+            <span class="amount-equiv mono" id="amount-equiv">≈ 0.000000 BTC</span>
+          </div>
+
+          <div class="presets">
+            <button type="button" class="preset-btn" data-usd="1000">$1k</button>
+            <button type="button" class="preset-btn" data-usd="2000">$2k</button>
+            <button type="button" class="preset-btn" data-usd="5000">$5k</button>
+            <button type="button" class="preset-btn" data-usd="10000">$10k</button>
+            <button type="button" class="preset-btn active" data-usd="20000">$20k</button>
+            <button type="button" class="preset-btn" data-usd="50000">$50k</button>
+          </div>
+        </div>
+
+        <!-- Tranches / Chunks -->
+        <div class="field">
+          <label for="tranches-select">4. Dividir en tramos (simulador UTXO)</label>
+          <div class="tranche-row">
+            <select id="tranches-select">
+              <option value="1" selected>1 transacción (óptimo UTXO)</option>
+              <option value="2">2 tramos (50% / 50%)</option>
+              <option value="3">3 tramos (prueba + 2 grandes)</option>
+              <option value="5">5 tramos</option>
+              <option value="10">10 tramos (alto coste UTXO futuro)</option>
+            </select>
+            <button type="button" id="btn-search" class="btn-primary">
+              <span class="btn-spinner" id="btn-spinner"></span>
+              <span id="btn-search-text">Buscar mejor ruta</span>
+            </button>
+          </div>
+          <p class="hint" id="utxo-hint"></p>
+        </div>
+      </div>
+
+      <!-- Protocol Status Bar -->
+      <div class="status-bar" id="protocol-status-bar">
+        <span class="status-title">Estado protocolos:</span>
+        <div class="status-pills" id="status-pills">
+          <span class="status-pill loading">Comprobando APIs...</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Results Section -->
+    <section class="results-section">
+      <div class="results-toolbar">
+        <div class="results-title-wrap">
+          <h2 id="results-heading">Mejores rutas en tiempo real</h2>
+          <span class="results-count" id="results-count"></span>
+        </div>
+
+        <div class="filter-controls">
+          <label class="checkbox-pill">
+            <input type="checkbox" id="filter-no-usd" />
+            <span>0% exposición a USD</span>
+          </label>
+          <div class="sort-group">
+            <button type="button" class="sort-btn active" data-sort="net">Mayor BTC neto</button>
+            <button type="button" class="sort-btn" data-sort="speed">Más rápida</button>
+            <button type="button" class="sort-btn" data-sort="steps">Menos pasos</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Winner Banner -->
+      <div id="winner-banner" class="winner-banner hidden"></div>
+
+      <!-- Loading Skeleton -->
+      <div id="loading-state" class="loading-box hidden">
+        <div class="loader-ring"></div>
+        <div>
+          <strong>Consultando liquidez y cotizaciones en vivo...</strong>
+          <p id="loading-detail">Consultando DefiLlama, Mempool, KyberSwap, Across, Garden, Threshold, NEAR Intents, THORChain, Chainflip, Symbiosis y Maya...</p>
+        </div>
+      </div>
+
+      <!-- Route Cards -->
+      <div id="routes-list" class="routes-list"></div>
+
+      <!-- Unavailable / Halted Protocols -->
+      <details id="unavailable-section" class="unavailable-box hidden">
+        <summary>
+          <span>⚠️ Rutas no disponibles, pausadas o descartadas en este momento (<span id="unavailable-count">0</span>)</span>
+        </summary>
+        <div id="unavailable-list" class="unavailable-list"></div>
+      </details>
+    </section>
+
+    <!-- Security Checklist -->
+    <section class="panel checklist-panel">
+      <h3>Checklist de seguridad antes de firmar</h3>
+      <div class="checklist-grid">
+        <div class="check-item">
+          <strong>1. Prueba pequeña primero</strong>
+          <p>En importes medianos/grandes, haz una primera prueba de ~$800–$1.000 (mínimo <code class="mono">0.01 BTC</code> en Threshold) para verificar tu dirección <code class="mono">bc1q...</code> o <code class="mono">bc1p...</code>.</p>
+        </div>
+        <div class="check-item">
+          <strong>2. Verifica contratos y URLs</strong>
+          <p>Accede solo a los dominios oficiales enlazados en cada ruta y aprueba en tu wallet únicamente la cantidad exacta a mover.</p>
+        </div>
+        <div class="check-item">
+          <strong>3. Gas preparado en origen (y Base si aplica)</strong>
+          <p>Mantén $2–$5 del token de gas nativo en tu red origen (y ~$1 de ETH en Base si eliges la ruta optimizada <code class="mono">Base cbBTC + Garden 9 bps</code>).</p>
+        </div>
+        <div class="check-item">
+          <strong>4. Cuida tus UTXOs en Bitcoin</strong>
+          <p>Evita fraccionar en 10+ transacciones pequeñas: 1 prueba + 2 o 3 tramos grandes te ahorran comisiones futuras al mover tu BTC cuando suba el mempool.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container footer-inner">
+      <span>100% open-source · Sin backend · Sin tracking · Cotizaciones directas desde APIs públicas DeFi.</span>
+      <span>Verifica siempre el importe neto final en la dApp oficial antes de firmar.</span>
+    </div>
+  </footer>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
