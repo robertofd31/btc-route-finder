@@ -55,13 +55,13 @@
       <div class="controls-grid">
         <!-- Chain Selector -->
         <div class="field">
-          <label for="chain-select">1. Red de origen</label>
+          <label for="chain-select">1. Red de origen <span class="label-hint">(o elige «Todas» para escanear el mejor par global)</span></label>
           <div class="chain-pills" id="chain-pills"></div>
         </div>
 
         <!-- Token Selector -->
         <div class="field">
-          <label for="token-select">2. Activo sintético BTC</label>
+          <label for="token-select" id="token-field-label">2. Activo sintético BTC</label>
           <div class="token-pills" id="token-pills"></div>
           <div class="contract-bar" id="contract-bar">
             <span class="contract-label">Contrato verificado:</span>
@@ -137,6 +137,10 @@
           <label class="checkbox-pill">
             <input type="checkbox" id="filter-no-usd" />
             <span>0% exposición a USD</span>
+          </label>
+          <label class="checkbox-pill">
+            <input type="checkbox" id="filter-cross-chain" checked />
+            <span>Incluir saltos de red (Base / ETH)</span>
           </label>
           <div class="sort-group">
             <button type="button" class="sort-btn active" data-sort="net">Mayor BTC neto</button>

@@ -4,6 +4,10 @@ Panel web estático y gratuito (sin backend ni claves de API) para encontrar en 
 
 🔗 **Panel en vivo (GitHub Pages):** `https://robertofd31.github.io/btc-route-finder/`
 
+## Modos de búsqueda
+- **🌐 Escáner Global («Todas las redes»):** busca automáticamente la mejor ruta de salida a BTC nativo escaneando en paralelo las 7 redes sin tener que elegir red de origen (con filtro opcional por activo).
+- **🔀 Saltos Cross-Chain automáticos:** al elegir cualquier red (p. ej. Arbitrum, Optimism o Polygon), el motor también calcula automáticamente si compensa cruzar primero a **Base** (vía Across → `cbBTC` + Garden `9 bps` / NEAR Intents / Threshold `tBTC`) o a **Ethereum Mainnet** (vía Across → THORChain `ETH.WBTC` / Garden / Threshold L1, descontando gas L1 estimado).
+
 ## Redes y activos sintéticos soportados
 - **Arbitrum One:** `WBTC`, `cbBTC`, `tBTC`, `BTC.b`
 - **Ethereum:** `WBTC`, `cbBTC`, `tBTC`, `LBTC`, `kBTC`

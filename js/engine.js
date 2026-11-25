@@ -21,7 +21,6 @@ async function fetchJson(url, options = {}, timeoutMs = 12000) {
 }
 
 export function toBaseUnits(amountFloat, decimals) {
-  // Precision-safe string conversion to integer string
   const fixed = Number(amountFloat).toFixed(Math.min(decimals, 8));
   const [intPart, fracPart = ""] = fixed.split(".");
   const padded = (fracPart + "0".repeat(decimals)).slice(0, decimals);
@@ -38,34 +37,46 @@ export function fromBaseUnits(rawStr, decimals) {
 }
 
 /**
- * Fetch live reference prices (BTC spot + selected token) and Bitcoin mempool fees
+ * Fetch live reference prices (BTC spot + selected token or all flagship tokens) and Bitcoin mempool fees
  */
 export async function fetchTelemetry(chainId, tokenSymbol) {
-  const chain = CHAINS[chainId];
-  const token = chain.tokens[tokenSymbol];
-  const llamaKey = `${chain.llamaPrefix}:${token.address}`;
+  const keys = ["coingecko:bitcoin"];
+  let activeKey = null;
+
+  if (chainId === "all") {
+    for (const c of Object.values(CHAINS)) {
+      for (const t of Object.values(c.tokens)) {
+        keys.push(`${c.llamaPrefix}:${t.address}`);
+      }
+    }
+  } else {
+    const chain = CHAINS[chainId];
+    const token = chain.tokens[tokenSymbol];
+    activeKey = `${chain.llamaPrefix}:${token.address}`;
+    keys.push(activeKey);
+  }
 
   const [priceRes, mempoolRes] = await Promise.all([
-    fetchJson(`https://coins.llama.fi/prices/current/coingecko:bitcoin,${llamaKey}`),
+    fetchJson(`https://coins.llama.fi/prices/current/${keys.join(",")}`),
     fetchJson("https://mempool.space/api/v1/fees/recommended"),
   ]);
 
   const coins = priceRes.ok ? priceRes.data?.coins || {} : {};
   const btcPrice = coins["coingecko:bitcoin"]?.price || 0;
-  const tokenPrice = coins[llamaKey]?.price || btcPrice;
+  const tokenPrice = activeKey ? (coins[activeKey]?.price || btcPrice) : btcPrice;
   const pegPct = btcPrice > 0 ? ((tokenPrice / btcPrice) - 1) * 100 : 0;
 
   const mempool = mempoolRes.ok
     ? mempoolRes.data
     : { fastestFee: 2, halfHourFee: 2, economyFee: 1 };
 
-  // Estimate standard SegWit (140 vB) tx fee in BTC
   const estBtcTxFeeBtc = ((mempool.halfHourFee || 2) * 140) / 1e8;
 
   return {
     btcPrice,
     tokenPrice,
     pegPct,
+    coins,
     mempool,
     estBtcTxFeeBtc,
     timestamp: new Date(),
@@ -110,11 +121,10 @@ async function quoteGarden(fromId, amountRaw) {
 }
 
 /**
- * Across bridge suggested-fees quote (USDC origin -> Base)
+ * Generic Across bridge quote for USDC between any two Across-supported 6-decimal USDC chains
  */
-async function quoteAcrossUsdcToBase(originChain, usdcAmountRaw) {
-  const baseUsdc = CHAINS.base.usdc.address;
-  const url = `https://app.across.to/api/suggested-fees?inputToken=${originChain.usdc.address}&outputToken=${baseUsdc}&originChainId=${originChain.chainId}&destinationChainId=8453&amount=${usdcAmountRaw}`;
+async function quoteAcrossUsdc(originChain, destChain, usdcAmountRaw) {
+  const url = `https://app.across.to/api/suggested-fees?inputToken=${originChain.usdc.address}&outputToken=${destChain.usdc.address}&originChainId=${originChain.chainId}&destinationChainId=${destChain.chainId}&amount=${usdcAmountRaw}`;
   const res = await fetchJson(url);
   if (!res.ok || !res.data?.totalRelayFee?.total) {
     return { ok: false, error: res.data?.message || res.error || `HTTP ${res.status}` };
@@ -122,18 +132,13 @@ async function quoteAcrossUsdcToBase(originChain, usdcAmountRaw) {
   const totalFeeRaw = BigInt(res.data.totalRelayFee.total);
   const inRaw = BigInt(usdcAmountRaw);
   if (inRaw <= totalFeeRaw) return { ok: false, error: "Importe menor que el fee de bridge" };
-  const netOriginDecimals = inRaw - totalFeeRaw;
-  // Convert to Base USDC (6 decimals)
-  const diffDec = originChain.usdc.decimals - 6;
-  const netBaseRaw = diffDec > 0
-    ? (netOriginDecimals / (10n ** BigInt(diffDec))).toString()
-    : (netOriginDecimals * (10n ** BigInt(-diffDec))).toString();
+  const netRaw = (inRaw - totalFeeRaw).toString();
 
   return {
     ok: true,
     feeUsdc: fromBaseUnits(totalFeeRaw.toString(), originChain.usdc.decimals),
-    netBaseUsdcRaw: netBaseRaw,
-    netBaseUsdc: fromBaseUnits(netBaseRaw, 6),
+    netDestUsdcRaw: netRaw,
+    netDestUsdc: fromBaseUnits(netRaw, destChain.usdc.decimals),
     estFillSec: res.data.estimatedFillTimeSec || 2,
   };
 }
@@ -167,7 +172,6 @@ async function quoteNearIntents(originAssetId, amountRaw) {
   }
   const q = res.data.quote;
   const rawBtcOut = fromBaseUnits(q.amountOut, 8);
-  // Note: Unauthenticated 1Click API adds 25 bps (0.25%) platform fee that official app.near-intents.org UI doesn't charge
   const estUiBtcOut = rawBtcOut / (1 - 0.0025);
   return {
     ok: true,
@@ -190,7 +194,7 @@ async function quoteSymbiosis(chainIdNum, tokenAddr, decimals, amountRaw) {
     },
     tokenOut: {
       address: "",
-      chainId: 3652501241, // Bitcoin on Symbiosis
+      chainId: 3652501241,
       decimals: 8,
     },
     from: DUMMY_EVM,
@@ -246,7 +250,6 @@ async function quoteChainflip(srcChain, srcAsset, amountRaw) {
   if (!res.ok || !Array.isArray(res.data) || !res.data.length) {
     return { ok: false, status: res.status, error: res.data?.message || res.error || `HTTP ${res.status}` };
   }
-  // Prefer DCA quote if available and gives more BTC
   const sorted = [...res.data].sort((a, b) => Number(b.egressAmount || 0) - Number(a.egressAmount || 0));
   const best = sorted[0];
   return {
@@ -274,14 +277,24 @@ async function quoteMaya(fromAsset, amount1e8) {
 }
 
 /**
- * Master route discovery engine:
- * Runs ALL viable No-KYC routes in parallel for (chainId, tokenSymbol, amountBtcPerTx, tranches)
+ * Master route discovery engine for a SINGLE (chainId, tokenSymbol)
+ * Evaluates BOTH direct same-chain routes AND cross-chain intermediate hops (e.g., Arbitrum -> Base / Arbitrum -> Ethereum)
  */
-export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tranches = 1, telemetry }) {
+export async function findBestRoutes({
+  chainId,
+  tokenSymbol,
+  totalAmountBtc,
+  tranches = 1,
+  telemetry,
+  sharedMimir = null,
+  includeSymbiosis = true,
+  includeCrossChainHops = true,
+}) {
   const chain = CHAINS[chainId];
   const token = chain.tokens[tokenSymbol];
   const amountPerTx = totalAmountBtc / tranches;
   const amountRaw = toBaseUnits(amountPerTx, token.decimals);
+  const btcPrice = telemetry.btcPrice || 60000;
 
   const routes = [];
   const unavailable = [];
@@ -294,32 +307,26 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
     Symbiosis: { state: "unknown", label: "Symbiosis" },
   };
 
-  // Pre-fetch shared intermediate DEX swaps on origin chain (to USDC, to tBTC, to Garden-native token if different, to BTC.b on Avax)
+  // Pre-fetch shared intermediate DEX swaps on origin chain
   const dexPromises = {};
-
-  // 1) Origin -> USDC on origin chain (needed for Base+Garden, NEAR Intents, Chainflip, THORChain)
   dexPromises.toUsdc = quoteKyberSwap(chain.kyberSlug, token.address, chain.usdc.address, amountRaw, chain.usdc.decimals);
 
-  // 2) Origin -> tBTC on origin chain (if chain supports Threshold direct redeem and token isn't already tBTC)
   const chainTbtc = Object.values(chain.tokens).find((t) => t.isTbtc);
   if (chain.thresholdDirectRedeem && chainTbtc && !token.isTbtc) {
     dexPromises.toTbtc = quoteKyberSwap(chain.kyberSlug, token.address, chainTbtc.address, amountRaw, chainTbtc.decimals);
   }
 
-  // 3) Origin -> chain's native Garden BTC asset (if token itself isn't Garden-native, e.g., Arb cbBTC -> Arb WBTC)
   const chainGardenToken = Object.values(chain.tokens).find((t) => t.gardenId);
   if (chainGardenToken && !token.gardenId) {
     dexPromises.toGardenToken = quoteKyberSwap(chain.kyberSlug, token.address, chainGardenToken.address, amountRaw, chainGardenToken.decimals);
   }
 
-  // 4) Avalanche WBTC.e -> BTC.b
   const chainBtcb = Object.values(chain.tokens).find((t) => t.isBtcb);
   if (chainId === "avalanche" && chainBtcb && !token.isBtcb) {
     dexPromises.toBtcb = quoteKyberSwap(chain.kyberSlug, token.address, chainBtcb.address, amountRaw, chainBtcb.decimals);
   }
 
-  // Also kick off THORChain Mimir check in parallel
-  const mimirPromise = fetchThorMimir();
+  const mimirPromise = sharedMimir ? Promise.resolve(sharedMimir) : fetchThorMimir();
 
   const [usdcDex, tbtcDex, gardenTokenDex, btcbDex, mimirRes] = await Promise.all([
     dexPromises.toUsdc,
@@ -329,13 +336,21 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
     mimirPromise,
   ]);
 
-  // Helper to record a valid route
+  const m = mimirRes.ok ? mimirRes.mimir : {};
+  const btcHalted = Number(m.HALTBTCTRADING || 0) !== 0 || Number(m.HALTTRADING || 0) !== 0;
+  const baseHalted = Number(m.HALTBASETRADING || 0) !== 0;
+
   const addRoute = (r) => {
     const totalBtcOut = r.btcOutPerTx * tranches;
     const diffPct = ((totalBtcOut / totalAmountBtc) - 1) * 100;
-    const diffUsd = (totalBtcOut - totalAmountBtc) * (telemetry.btcPrice || 0);
+    const diffUsd = (totalBtcOut - totalAmountBtc) * btcPrice;
     routes.push({
       ...r,
+      originChainId: chainId,
+      originChainName: chain.name,
+      originChainColor: chain.color,
+      originToken: token.symbol,
+      crossChainHop: Boolean(r.crossChainHop),
       totalBtcOut,
       diffPct,
       diffUsd,
@@ -343,7 +358,6 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
     });
   };
 
-  // Launch ALL cross-chain route evaluations in parallel
   const tasks = [];
 
   // =========================================================================
@@ -355,7 +369,7 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
       if (q.ok) {
         protocolHealth.Garden = { state: "ok", label: `Garden (${q.feeBps ?? "?"} bps)` };
         addRoute({
-          id: "garden-direct",
+          id: `${chainId}-${token.symbol}-garden-direct`,
           name: `Garden Finance Directo (${chain.name} ${token.symbol})`,
           protocol: "Garden Finance",
           model: "HTLC Atomic Swap",
@@ -385,7 +399,7 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
       if (q.ok) {
         protocolHealth.Garden = { state: "ok", label: `Garden (${q.feeBps ?? "?"} bps)` };
         addRoute({
-          id: "garden-swap",
+          id: `${chainId}-${token.symbol}-garden-swap`,
           name: `DEX (${token.symbol} → ${chainGardenToken.symbol}) → Garden Finance`,
           protocol: "Garden Finance",
           model: "DEX + HTLC",
@@ -416,80 +430,293 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
   }
 
   // =========================================================================
-  // ROUTE 2: GARDEN "9-BPS BASE HACK" (Any Across-supported chain -> Base cbBTC -> Garden)
+  // ROUTE 2 (CROSS-CHAIN HOP → BASE): Origin -> Across USDC -> Base ->
+  //   (a) cbBTC -> Garden Finance (9 bps!)
+  //   (b) cbBTC -> NEAR Intents (directo)
+  //   (c) tBTC  -> Threshold Network Redeem
   // =========================================================================
-  if (chainId !== "base" && chain.acrossSupported && usdcDex?.ok) {
+  if (includeCrossChainHops && chainId !== "base" && chain.acrossSupported && usdcDex?.ok) {
     tasks.push((async () => {
-      const across = await quoteAcrossUsdcToBase(chain, usdcDex.amountOutRaw);
-      if (!across.ok) {
-        unavailable.push({ name: "Base cbBTC + Garden (9 bps)", reason: `Across: ${across.error}` });
+      const acrossBase = await quoteAcrossUsdc(chain, CHAINS.base, usdcDex.amountOutRaw);
+      if (!acrossBase.ok) {
+        unavailable.push({ name: `Salto ${chain.name} → Base (Across)`, reason: acrossBase.error });
         return;
       }
-      const baseSwap = await quoteKyberSwap(
-        "base",
-        CHAINS.base.usdc.address,
-        CHAINS.base.tokens.cbBTC.address,
-        across.netBaseUsdcRaw,
-        8
-      );
-      if (!baseSwap.ok) {
-        unavailable.push({ name: "Base cbBTC + Garden (9 bps)", reason: `DEX Base: ${baseSwap.error}` });
-        return;
+
+      // Quote Base DEX swaps in parallel: USDC -> cbBTC and USDC -> tBTC
+      const [baseCbbtcSwap, baseTbtcSwap] = await Promise.all([
+        quoteKyberSwap("base", CHAINS.base.usdc.address, CHAINS.base.tokens.cbBTC.address, acrossBase.netDestUsdcRaw, 8),
+        quoteKyberSwap("base", CHAINS.base.usdc.address, CHAINS.base.tokens.tBTC.address, acrossBase.netDestUsdcRaw, 18),
+      ]);
+
+      const subTasks = [];
+
+      // 2a. Base cbBTC -> Garden (9 bps!)
+      if (baseCbbtcSwap.ok) {
+        subTasks.push((async () => {
+          const g = await quoteGarden("base:cbbtc", baseCbbtcSwap.amountOutRaw);
+          if (!g.ok) return;
+          if (protocolHealth.Garden.state === "unknown") {
+            protocolHealth.Garden = { state: "ok", label: `Garden (${g.feeBps} bps Base)` };
+          }
+          addRoute({
+            id: `${chainId}-${token.symbol}-hop-base-garden`,
+            name: `Salto a Base (Across) → cbBTC → Garden Finance (${g.feeBps ?? 9} bps)`,
+            protocol: "Across + Garden (Base)",
+            model: "Cross-Chain Hop + HTLC",
+            crossChainHop: true,
+            btcOutPerTx: g.btcOut,
+            etaMinutes: 14,
+            etaLabel: "~10–15 min",
+            stepsCount: 4,
+            usdExposure: true,
+            tags: ["🔀 Salto a Base", `Garden solo ${g.feeBps ?? 9} bps`, `Across ${acrossBase.estFillSec}s ($${acrossBase.feeUsdc.toFixed(2)})`],
+            note: `Cruzar ${chain.name} → Base cuesta solo $${acrossBase.feeUsdc.toFixed(2)} en Across (${acrossBase.estFillSec}s) y desbloquea la tarifa reducida de Garden en Base cbBTC (${g.feeBps ?? 9} bps). Necesitas ~$1 de ETH en Base para gas.`,
+            steps: [
+              {
+                text: `En ${chain.name}, cambia ${amountPerTx.toFixed(6)} ${token.symbol} → ~${usdcDex.amountOut.toFixed(2)} USDC.`,
+                linkLabel: "Abrir DefiLlama Swap",
+                linkUrl: DAPP_LINKS.defiLlamaSwap,
+              },
+              {
+                text: `Puentea USDC de ${chain.name} → Base vía Across (~${acrossBase.estFillSec}s, fee $${acrossBase.feeUsdc.toFixed(2)}).`,
+                linkLabel: "Abrir Across",
+                linkUrl: DAPP_LINKS.across,
+              },
+              {
+                text: `En Base, cambia ~${acrossBase.netDestUsdc.toFixed(2)} USDC → ~${baseCbbtcSwap.amountOut.toFixed(6)} cbBTC.`,
+                linkLabel: "Abrir KyberSwap Base",
+                linkUrl: DAPP_LINKS.kyberSwap,
+              },
+              {
+                text: `En Garden Finance selecciona Base cbBTC → Bitcoin BTC (${g.feeBps ?? 9} bps) hacia tu dirección bc1q.../bc1p...`,
+                linkLabel: "Abrir Garden Finance",
+                linkUrl: DAPP_LINKS.garden,
+              },
+            ],
+          });
+        })());
+
+        // 2b. Base cbBTC -> NEAR Intents (direct)
+        subTasks.push((async () => {
+          const n = await quoteNearIntents(CHAINS.base.tokens.cbBTC.nearDirectId, baseCbbtcSwap.amountOutRaw);
+          if (!n.ok) return;
+          addRoute({
+            id: `${chainId}-${token.symbol}-hop-base-near`,
+            name: `Salto a Base (Across) → cbBTC → NEAR Intents`,
+            protocol: "Across + NEAR (Base)",
+            model: "Cross-Chain Hop + Solvers",
+            crossChainHop: true,
+            btcOutPerTx: n.rawBtcOut,
+            etaMinutes: Math.max(8, Math.round(n.timeSec / 60) + 2),
+            etaLabel: `~${Math.max(8, Math.round(n.timeSec / 60) + 2)} min`,
+            stepsCount: 4,
+            usdExposure: true,
+            tags: ["🔀 Salto a Base", `Across $${acrossBase.feeUsdc.toFixed(2)}`, `UI oficial est. ~${(n.estUiBtcOut * tranches).toFixed(6)} BTC`],
+            note: `Cruza a Base y sal vía Base cbBTC en NEAR Intents (en la UI oficial sin recargo API de 25 bps mejora hasta ~${(n.estUiBtcOut * tranches).toFixed(6)} BTC).`,
+            steps: [
+              {
+                text: `Cambia ${amountPerTx.toFixed(6)} ${token.symbol} → USDC en ${chain.name} y puentea a Base vía Across ($${acrossBase.feeUsdc.toFixed(2)}).`,
+                linkLabel: "Abrir Across",
+                linkUrl: DAPP_LINKS.across,
+              },
+              {
+                text: `En Base, cambia USDC → ~${baseCbbtcSwap.amountOut.toFixed(6)} cbBTC.`,
+                linkLabel: "Abrir KyberSwap Base",
+                linkUrl: DAPP_LINKS.kyberSwap,
+              },
+              {
+                text: `En NEAR Intents selecciona Base cbBTC → BTC nativo.`,
+                linkLabel: "Abrir NEAR Intents",
+                linkUrl: DAPP_LINKS.nearIntents,
+              },
+            ],
+          });
+        })());
       }
-      const g = await quoteGarden("base:cbbtc", baseSwap.amountOutRaw);
-      if (!g.ok) {
-        unavailable.push({ name: "Base cbBTC + Garden (9 bps)", reason: `Garden Base: ${g.error}` });
-        return;
+
+      // 2c. Base tBTC -> Threshold Redeem (useful when origin chain has no direct Threshold or worse tBTC spread)
+      if (baseTbtcSwap.ok && baseTbtcSwap.amountOut >= 0.01) {
+        const protocolFee = baseTbtcSwap.amountOut * 0.002;
+        const minerSweep = Math.max(telemetry.estBtcTxFeeBtc * 2.5, 0.000008);
+        const netBtc = baseTbtcSwap.amountOut - protocolFee - minerSweep;
+        addRoute({
+          id: `${chainId}-${token.symbol}-hop-base-tbtc`,
+          name: `Salto a Base (Across) → tBTC → Threshold Redeem`,
+          protocol: "Across + Threshold (Base)",
+          model: "Cross-Chain Hop + Burn 1:1",
+          crossChainHop: true,
+          btcOutPerTx: netBtc,
+          etaMinutes: 185,
+          etaLabel: "~1–5 horas",
+          stepsCount: 4,
+          usdExposure: true,
+          tags: ["🔀 Salto a Base", "Threshold 0,20%", `Across $${acrossBase.feeUsdc.toFixed(2)}`],
+          note: `Útil si la liquidez de tBTC en Base supera a la de ${chain.name}. Requiere ~$1 de ETH en Base para gas y redención mínima 0,01 BTC.`,
+          steps: [
+            {
+              text: `Cambia ${amountPerTx.toFixed(6)} ${token.symbol} → USDC en ${chain.name} y puentea a Base vía Across ($${acrossBase.feeUsdc.toFixed(2)}).`,
+              linkLabel: "Abrir Across",
+              linkUrl: DAPP_LINKS.across,
+            },
+            {
+              text: `En Base, cambia USDC → ~${baseTbtcSwap.amountOut.toFixed(6)} tBTC.`,
+              linkLabel: "Abrir KyberSwap Base",
+              linkUrl: DAPP_LINKS.kyberSwap,
+            },
+            {
+              text: `Redime tBTC desde Base en Threshold Network hacia tu dirección bc1q.../bc1p...`,
+              linkLabel: "Abrir Threshold App",
+              linkUrl: DAPP_LINKS.threshold,
+            },
+          ],
+        });
       }
-      if (protocolHealth.Garden.state === "unknown") {
-        protocolHealth.Garden = { state: "ok", label: `Garden (${g.feeBps} bps Base)` };
-      }
-      addRoute({
-        id: "base-cbbtc-garden",
-        name: `Across a Base → cbBTC → Garden Finance (${g.feeBps ?? 9} bps)`,
-        protocol: "Across + Garden (Base)",
-        model: "Intent Bridge + HTLC",
-        btcOutPerTx: g.btcOut,
-        etaMinutes: 14,
-        etaLabel: "~10–15 min",
-        stepsCount: 4,
-        usdExposure: true,
-        tags: [`Garden solo ${g.feeBps ?? 9} bps`, `Across ${across.estFillSec}s ($${across.feeUsdc.toFixed(2)})`, "HTLC sin custodia"],
-        note: `Aprovecha que Garden cobra ~la mitad en Base cbBTC (${g.feeBps ?? 9} bps). Necesitas ~$1 de ETH en Base para gas. Breve exposición a USDC (~1 min).`,
-        steps: [
-          {
-            text: `En ${chain.name}, cambia ${amountPerTx.toFixed(6)} ${token.symbol} → ~${usdcDex.amountOut.toFixed(2)} USDC.`,
-            linkLabel: "Abrir CoW / DefiLlama",
-            linkUrl: DAPP_LINKS.defiLlamaSwap,
-          },
-          {
-            text: `Puentea USDC de ${chain.name} → Base vía Across (~${across.estFillSec}s, fee $${across.feeUsdc.toFixed(2)}).`,
-            linkLabel: "Abrir Across",
-            linkUrl: DAPP_LINKS.across,
-          },
-          {
-            text: `En Base, cambia ~${across.netBaseUsdc.toFixed(2)} USDC → ~${baseSwap.amountOut.toFixed(6)} cbBTC.`,
-            linkLabel: "Abrir KyberSwap Base",
-            linkUrl: DAPP_LINKS.kyberSwap,
-          },
-          {
-            text: `En Garden Finance selecciona Base cbBTC → Bitcoin BTC (${g.feeBps ?? 9} bps) hacia tu bc1q.../bc1p...`,
-            linkLabel: "Abrir Garden Finance",
-            linkUrl: DAPP_LINKS.garden,
-          },
-        ],
-      });
+
+      await Promise.all(subTasks);
     })());
   }
 
   // =========================================================================
-  // ROUTE 3: THRESHOLD NETWORK tBTC DIRECT REDEMPTION (0.20% protocol fee + BTC miner fee)
+  // ROUTE 3 (CROSS-CHAIN HOP → ETHEREUM L1): Origin L2 -> Across USDC -> Ethereum ->
+  //   (a) WBTC -> THORChain Streaming (ETH.WBTC — deep pool!)
+  //   (b) WBTC -> Garden Finance (ethereum:wbtc — 9 bps!)
+  //   (c) tBTC -> Threshold L1 Redeem (no L2 relayer!)
+  //   *Deducts estimated Ethereum L1 gas (~$6 in BTC) honestly!*
+  // =========================================================================
+  if (includeCrossChainHops && chainId !== "ethereum" && chain.acrossSupported && usdcDex?.ok) {
+    tasks.push((async () => {
+      const acrossEth = await quoteAcrossUsdc(chain, CHAINS.ethereum, usdcDex.amountOutRaw);
+      if (!acrossEth.ok) return;
+
+      const estEthGasBtc = 6 / btcPrice; // Conservative ~$6 total L1 gas (approve + swap + deposit)
+      const [ethWbtcSwap, ethTbtcSwap] = await Promise.all([
+        quoteKyberSwap("ethereum", CHAINS.ethereum.usdc.address, CHAINS.ethereum.tokens.WBTC.address, acrossEth.netDestUsdcRaw, 8),
+        quoteKyberSwap("ethereum", CHAINS.ethereum.usdc.address, CHAINS.ethereum.tokens.tBTC.address, acrossEth.netDestUsdcRaw, 18),
+      ]);
+
+      const subTasks = [];
+
+      // 3a. Eth WBTC -> THORChain Streaming
+      if (ethWbtcSwap.ok && mimirRes.ok && !btcHalted) {
+        subTasks.push((async () => {
+          const tc = await quoteThorChain(CHAINS.ethereum.tokens.WBTC.thorAsset, toBaseUnits(ethWbtcSwap.amountOut, 8));
+          if (!tc.ok) return;
+          const netBtc = Math.max(0, tc.btcOut - estEthGasBtc);
+          addRoute({
+            id: `${chainId}-${token.symbol}-hop-eth-thorchain`,
+            name: `Salto a Ethereum (Across) → WBTC → THORChain Streaming`,
+            protocol: "Across + THORChain (ETH)",
+            model: "Cross-Chain Hop + Streaming",
+            crossChainHop: true,
+            btcOutPerTx: netBtc,
+            etaMinutes: Math.max(15, Math.round(tc.timeSec / 60) + 3),
+            etaLabel: `~${Math.max(15, Math.round(tc.timeSec / 60) + 3)} min`,
+            stepsCount: 4,
+            usdExposure: true,
+            tags: ["🔀 Salto a Ethereum", "Pool ETH.WBTC profundo", "Incluye ~$6 gas L1"],
+            note: `Cruzar a Ethereum L1 desbloquea el pool profundo ETH.WBTC de THORChain Streaming. Ya descontamos ~$6 de gas L1 y $${acrossEth.feeUsdc.toFixed(2)} de Across; suele brillar en importes ≥$15k.`,
+            steps: [
+              {
+                text: `Cambia ${amountPerTx.toFixed(6)} ${token.symbol} → USDC en ${chain.name} y puentea a Ethereum vía Across ($${acrossEth.feeUsdc.toFixed(2)}).`,
+                linkLabel: "Abrir Across",
+                linkUrl: DAPP_LINKS.across,
+              },
+              {
+                text: `En Ethereum, cambia USDC → ~${ethWbtcSwap.amountOut.toFixed(6)} WBTC (necesitas ETH en Mainnet para gas).`,
+                linkLabel: "Abrir CoW Swap",
+                linkUrl: DAPP_LINKS.cowSwap,
+              },
+              {
+                text: `Ejecuta Streaming Swap de ETH.WBTC → BTC nativo en THORChain (Asgardex / THORSwap).`,
+                linkLabel: "Abrir THORSwap",
+                linkUrl: DAPP_LINKS.thorSwap,
+              },
+            ],
+          });
+        })());
+      }
+
+      // 3b. Eth WBTC -> Garden (9 bps!)
+      if (ethWbtcSwap.ok) {
+        subTasks.push((async () => {
+          const g = await quoteGarden("ethereum:wbtc", ethWbtcSwap.amountOutRaw);
+          if (!g.ok) return;
+          const netBtc = Math.max(0, g.btcOut - estEthGasBtc);
+          addRoute({
+            id: `${chainId}-${token.symbol}-hop-eth-garden`,
+            name: `Salto a Ethereum (Across) → WBTC → Garden (${g.feeBps ?? 9} bps)`,
+            protocol: "Across + Garden (ETH)",
+            model: "Cross-Chain Hop + HTLC",
+            crossChainHop: true,
+            btcOutPerTx: netBtc,
+            etaMinutes: 15,
+            etaLabel: "~10–15 min",
+            stepsCount: 4,
+            usdExposure: true,
+            tags: ["🔀 Salto a Ethereum", `Garden ${g.feeBps ?? 9} bps`, "Incluye ~$6 gas L1"],
+            note: `Salto a Ethereum Mainnet para aprovechar Garden ETH WBTC (${g.feeBps ?? 9} bps). Descontados ~$6 estimados de gas L1.`,
+            steps: [
+              {
+                text: `Cambia ${amountPerTx.toFixed(6)} ${token.symbol} → USDC en ${chain.name} y puentea a Ethereum vía Across ($${acrossEth.feeUsdc.toFixed(2)}).`,
+                linkLabel: "Abrir Across",
+                linkUrl: DAPP_LINKS.across,
+              },
+              {
+                text: `En Ethereum, cambia USDC → ~${ethWbtcSwap.amountOut.toFixed(6)} WBTC y ejecuta Garden (ETH WBTC → BTC).`,
+                linkLabel: "Abrir Garden Finance",
+                linkUrl: DAPP_LINKS.garden,
+              },
+            ],
+          });
+        })());
+      }
+
+      // 3c. Eth tBTC -> Threshold L1 Redeem
+      if (ethTbtcSwap.ok && ethTbtcSwap.amountOut >= 0.01) {
+        const protocolFee = ethTbtcSwap.amountOut * 0.002;
+        const minerSweep = Math.max(telemetry.estBtcTxFeeBtc * 2.5, 0.000008);
+        const netBtc = Math.max(0, ethTbtcSwap.amountOut - protocolFee - minerSweep - estEthGasBtc);
+        addRoute({
+          id: `${chainId}-${token.symbol}-hop-eth-tbtc`,
+          name: `Salto a Ethereum (Across) → tBTC → Threshold L1 Redeem`,
+          protocol: "Across + Threshold (ETH)",
+          model: "Cross-Chain Hop + Burn L1",
+          crossChainHop: true,
+          btcOutPerTx: netBtc,
+          etaMinutes: 185,
+          etaLabel: "~1–5 horas",
+          stepsCount: 4,
+          usdExposure: true,
+          tags: ["🔀 Salto a Ethereum", "Sin relayer L2", "Incluye ~$6 gas L1"],
+          note: `Redención directa de tBTC desde Ethereum Mainnet (mayor liquidez DEX y sin relayer L2). Descontados ~$6 estimados de gas L1.`,
+          steps: [
+            {
+              text: `Cambia ${amountPerTx.toFixed(6)} ${token.symbol} → USDC en ${chain.name} y puentea a Ethereum vía Across ($${acrossEth.feeUsdc.toFixed(2)}).`,
+              linkLabel: "Abrir Across",
+              linkUrl: DAPP_LINKS.across,
+            },
+            {
+              text: `En Ethereum, cambia USDC → ~${ethTbtcSwap.amountOut.toFixed(6)} tBTC y redime en Threshold Network.`,
+              linkLabel: "Abrir Threshold App",
+              linkUrl: DAPP_LINKS.threshold,
+            },
+          ],
+        });
+      }
+
+      await Promise.all(subTasks);
+    })());
+  }
+
+  // =========================================================================
+  // ROUTE 4: THRESHOLD NETWORK tBTC DIRECT REDEMPTION (Same Chain)
   // =========================================================================
   if (chain.thresholdDirectRedeem && chainTbtc) {
     tasks.push((async () => {
       let tbtcAmount = amountPerTx;
       let dexNote = "Ya tienes tBTC: 0% slippage DEX.";
-      let steps = [];
+      const steps = [];
 
       if (!token.isTbtc) {
         if (!tbtcDex?.ok) {
@@ -514,7 +741,6 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
         return;
       }
 
-      // Threshold protocol fee: 0.20% + live Bitcoin network sweep fee (estimate ~2x standard tx for threshold sweep)
       const protocolFeeBtc = tbtcAmount * 0.002;
       const estMinerSweepBtc = Math.max(telemetry.estBtcTxFeeBtc * 2.5, 0.000008);
       const netBtc = tbtcAmount - protocolFeeBtc - estMinerSweepBtc;
@@ -526,7 +752,7 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
       });
 
       addRoute({
-        id: "threshold-tbtc",
+        id: `${chainId}-${token.symbol}-threshold-tbtc`,
         name: token.isTbtc
           ? `Threshold Network Redeem Directo (${chain.name} tBTC)`
           : `DEX (${token.symbol} → tBTC) → Threshold Network Redeem`,
@@ -538,7 +764,7 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
         stepsCount: token.isTbtc ? 1 : 2,
         usdExposure: false,
         tags: ["Fee protocolo 0,20%", "0% slippage AMM en BTC", "0% exposición USD", "Mín. 0,01 BTC"],
-        note: `${dexNote} Respaldo 1:1 descentralizado (>4.000 BTC). Comprueba en la UI de Threshold el neto exacto (posible pequeño fee de relayer L2) antes de hacer el swap.`,
+        note: `${dexNote} Respaldo 1:1 descentralizado (>4.000 BTC). Comprueba en la UI de Threshold el neto exacto antes de hacer el swap.`,
         warnNote: "Tarda 1–5 horas; comprueba en app.threshold.network que las redenciones estén activas antes de convertir a tBTC.",
         steps,
       });
@@ -546,7 +772,7 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
   }
 
   // =========================================================================
-  // ROUTE 4: NEAR INTENTS (1Click Solver Network — Direct or via USDC)
+  // ROUTE 5: NEAR INTENTS (1Click Solver Network — Direct or via USDC)
   // =========================================================================
   if (token.nearDirectId || (chain.nearUsdcId && usdcDex?.ok)) {
     tasks.push((async () => {
@@ -560,7 +786,7 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
         if (!isDirect) {
           steps.push({
             text: `Cambia ${amountPerTx.toFixed(6)} ${token.symbol} → ~${usdcDex.amountOut.toFixed(2)} USDC en ${chain.name}.`,
-            linkLabel: "Abrir CoW / DefiLlama",
+            linkLabel: "Abrir DefiLlama Swap",
             linkUrl: DAPP_LINKS.defiLlamaSwap,
           });
         }
@@ -571,13 +797,12 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
         });
 
         addRoute({
-          id: "near-intents",
+          id: `${chainId}-${token.symbol}-near-intents`,
           name: isDirect
             ? `NEAR Intents Directo (${chain.name} ${token.symbol})`
             : `DEX (${token.symbol} → USDC) → NEAR Intents`,
           protocol: "NEAR Intents",
           model: "Solver Intents",
-          // Show conservative raw API quote as primary, and note the +0.25% better expected UI quote
           btcOutPerTx: q.rawBtcOut,
           etaMinutes: Math.max(5, Math.round(q.timeSec / 60)),
           etaLabel: `~${Math.max(5, Math.round(q.timeSec / 60))} min`,
@@ -599,40 +824,42 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
   }
 
   // =========================================================================
-  // ROUTE 5: SYMBIOSIS DIRECT (EVM -> Native BTC)
+  // ROUTE 6: SYMBIOSIS DIRECT (EVM -> Native BTC)
   // =========================================================================
-  tasks.push((async () => {
-    const q = await quoteSymbiosis(chain.chainId, token.address, token.decimals, amountRaw);
-    if (q.ok) {
-      protocolHealth.Symbiosis = { state: "ok", label: "Symbiosis" };
-      addRoute({
-        id: "symbiosis-direct",
-        name: `Symbiosis Finance Directo (${chain.name} ${token.symbol})`,
-        protocol: "Symbiosis",
-        model: "Cross-Chain AMM Bridge",
-        btcOutPerTx: q.btcOut,
-        etaMinutes: 20,
-        etaLabel: "~15–30 min",
-        stepsCount: 1,
-        usdExposure: false,
-        tags: ["1 solo paso", "0% exposición USD", "Sin KYC"],
-        note: "Puente directo en 1 firma desde tu wallet EVM pegando tu dirección bc1q.../bc1p...",
-        steps: [
-          {
-            text: `En Symbiosis selecciona ${token.symbol} (${chain.name}) → Bitcoin (BTC) e introduce tu dirección destino.`,
-            linkLabel: "Abrir Symbiosis",
-            linkUrl: DAPP_LINKS.symbiosis,
-          },
-        ],
-      });
-    } else {
-      protocolHealth.Symbiosis = { state: "warn", label: "Symbiosis (límite/err)" };
-      unavailable.push({ name: "Symbiosis Finance Directo", reason: q.error });
-    }
-  })());
+  if (includeSymbiosis) {
+    tasks.push((async () => {
+      const q = await quoteSymbiosis(chain.chainId, token.address, token.decimals, amountRaw);
+      if (q.ok) {
+        protocolHealth.Symbiosis = { state: "ok", label: "Symbiosis" };
+        addRoute({
+          id: `${chainId}-${token.symbol}-symbiosis-direct`,
+          name: `Symbiosis Finance Directo (${chain.name} ${token.symbol})`,
+          protocol: "Symbiosis",
+          model: "Cross-Chain AMM Bridge",
+          btcOutPerTx: q.btcOut,
+          etaMinutes: 20,
+          etaLabel: "~15–30 min",
+          stepsCount: 1,
+          usdExposure: false,
+          tags: ["1 solo paso", "0% exposición USD", "Sin KYC"],
+          note: "Puente directo en 1 firma desde tu wallet EVM pegando tu dirección bc1q.../bc1p...",
+          steps: [
+            {
+              text: `En Symbiosis selecciona ${token.symbol} (${chain.name}) → Bitcoin (BTC) e introduce tu dirección destino.`,
+              linkLabel: "Abrir Symbiosis",
+              linkUrl: DAPP_LINKS.symbiosis,
+            },
+          ],
+        });
+      } else {
+        protocolHealth.Symbiosis = { state: "warn", label: "Symbiosis (límite/err)" };
+        unavailable.push({ name: "Symbiosis Finance Directo", reason: q.error });
+      }
+    })());
+  }
 
   // =========================================================================
-  // ROUTE 6: LOMBARD / CORE (BTC.b 0.0001 BTC flat fee, or LBTC unstake)
+  // ROUTE 7: LOMBARD / CORE (BTC.b 0.0001 BTC flat fee, or LBTC unstake)
   // =========================================================================
   if (chainId === "avalanche" || token.isBtcb) {
     tasks.push((async () => {
@@ -662,7 +889,7 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
         linkUrl: DAPP_LINKS.lombard,
       });
       addRoute({
-        id: "lombard-btcb",
+        id: `${chainId}-${token.symbol}-lombard-btcb`,
         name: `Lombard / Core Redeem (${chain.name} BTC.b — 0.0001 BTC fijo)`,
         protocol: "Lombard / BTC.b",
         model: "Redención Fee Fijo",
@@ -683,7 +910,7 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
       const flatFee = 0.0001;
       if (amountPerTx > flatFee * 2) {
         addRoute({
-          id: "lombard-lbtc",
+          id: `${chainId}-${token.symbol}-lombard-lbtc`,
           name: `Lombard Unstake Nativo (${chain.name} LBTC → BTC)`,
           protocol: "Lombard Finance",
           model: "Unstake Nativo (7–9 días)",
@@ -707,7 +934,7 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
   }
 
   // =========================================================================
-  // ROUTE 7: THORCHAIN STREAMING SWAPS (with live Mimir halt detection)
+  // ROUTE 8: THORCHAIN STREAMING SWAPS (Same Chain)
   // =========================================================================
   tasks.push((async () => {
     if (!mimirRes.ok) {
@@ -715,9 +942,6 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
       unavailable.push({ name: "THORChain Streaming", reason: mimirRes.error });
       return;
     }
-    const m = mimirRes.mimir;
-    const btcHalted = Number(m.HALTBTCTRADING || 0) !== 0 || Number(m.HALTTRADING || 0) !== 0;
-    const baseHalted = Number(m.HALTBASETRADING || 0) !== 0;
 
     if (btcHalted) {
       protocolHealth.THORChain = { state: "down", label: "THORChain (BTC PAUSADO)" };
@@ -744,7 +968,7 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
     }
 
     if (!thorAsset) {
-      protocolHealth.THORChain = { state: "ok", label: "THORChain (L1/Base/BSC)" };
+      protocolHealth.THORChain = { state: "ok", label: "THORChain (ETH/Avax/BSC)" };
       return;
     }
 
@@ -765,7 +989,7 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
         linkUrl: DAPP_LINKS.thorSwap,
       });
       addRoute({
-        id: "thorchain-streaming",
+        id: `${chainId}-${token.symbol}-thorchain-streaming`,
         name: viaUsdc
           ? `DEX (${token.symbol} → USDC) → THORChain Streaming`
           : `THORChain Streaming Directo (${chain.name} ${token.symbol})`,
@@ -787,7 +1011,7 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
   })());
 
   // =========================================================================
-  // ROUTE 8: CHAINFLIP (JIT AMM + DCA)
+  // ROUTE 9: CHAINFLIP (JIT AMM + DCA)
   // =========================================================================
   if (token.chainflipAsset || (chainId === "arbitrum" && usdcDex?.ok)) {
     tasks.push((async () => {
@@ -803,7 +1027,7 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
         if (!isDirect) {
           steps.push({
             text: `Cambia ${amountPerTx.toFixed(6)} ${token.symbol} → ~${usdcDex.amountOut.toFixed(2)} USDC en Arbitrum.`,
-            linkLabel: "Abrir CoW / DefiLlama",
+            linkLabel: "Abrir DefiLlama Swap",
             linkUrl: DAPP_LINKS.defiLlamaSwap,
           });
         }
@@ -813,7 +1037,7 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
           linkUrl: DAPP_LINKS.chainflip,
         });
         addRoute({
-          id: "chainflip",
+          id: `${chainId}-${token.symbol}-chainflip`,
           name: isDirect
             ? `Chainflip ${q.type || "JIT"} Directo (${cfChain} ${cfAsset})`
             : `DEX (${token.symbol} → USDC) → Chainflip ${q.type || "DCA"}`,
@@ -845,14 +1069,14 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
   }
 
   // =========================================================================
-  // ROUTE 9: MAYA PROTOCOL (Arbitrum / Ethereum direct WBTC check)
+  // ROUTE 10: MAYA PROTOCOL (Arbitrum / Ethereum direct WBTC check)
   // =========================================================================
   if (token.mayaAsset) {
     tasks.push((async () => {
       const q = await quoteMaya(token.mayaAsset, toBaseUnits(amountPerTx, 8));
       if (q.ok) {
         addRoute({
-          id: "maya-direct",
+          id: `${chainId}-${token.symbol}-maya-direct`,
           name: `Maya Protocol Directo (${chain.name} ${token.symbol})`,
           protocol: "Maya Protocol",
           model: "Continuous Liquidity Pool",
@@ -881,13 +1105,80 @@ export async function findBestRoutes({ chainId, tokenSymbol, totalAmountBtc, tra
   }
 
   await Promise.all(tasks);
-
-  // Default sort: highest net BTC first
   routes.sort((a, b) => b.totalBtcOut - a.totalBtcOut);
 
+  return { routes, unavailable, protocolHealth };
+}
+
+/**
+ * GLOBAL SCANNER: Scans ALL 7 networks (and optional synthetic token filter like "ALL", "WBTC", "cbBTC", "tBTC", "BTC.b", "BTCB")
+ * without needing to pick a single origin chain!
+ */
+export async function findBestRoutesGlobal({ tokenFilter = "ALL", totalAmountBtc, tranches = 1, telemetry }) {
+  const sharedMimir = await fetchThorMimir();
+
+  // Pick candidate (chainId, tokenSymbol) pairs matching tokenFilter
+  const pairs = [];
+  for (const chain of Object.values(CHAINS)) {
+    for (const tok of Object.values(chain.tokens)) {
+      if (tokenFilter === "ALL") {
+        // Scan the top flagship liquid BTC wrappers across all 7 chains to stay fast & avoid rate limits
+        const flagship =
+          (chain.id === "arbitrum" && ["WBTC", "cbBTC"].includes(tok.symbol)) ||
+          (chain.id === "ethereum" && ["WBTC", "cbBTC"].includes(tok.symbol)) ||
+          (chain.id === "base" && ["cbBTC", "tBTC"].includes(tok.symbol)) ||
+          (chain.id === "optimism" && ["WBTC"].includes(tok.symbol)) ||
+          (chain.id === "avalanche" && ["BTC.b"].includes(tok.symbol)) ||
+          (chain.id === "polygon" && ["WBTC"].includes(tok.symbol)) ||
+          (chain.id === "bsc" && ["BTCB"].includes(tok.symbol));
+        if (flagship) pairs.push([chain.id, tok.symbol]);
+      } else {
+        // Match normalized symbol (e.g. WBTC matches WBTC and WBTC.e)
+        if (tok.symbol === tokenFilter || (tokenFilter === "WBTC" && tok.symbol === "WBTC.e")) {
+          pairs.push([chain.id, tok.symbol]);
+        }
+      }
+    }
+  }
+
+  const results = await Promise.all(
+    pairs.map(([cId, tSym]) =>
+      findBestRoutes({
+        chainId: cId,
+        tokenSymbol: tSym,
+        totalAmountBtc,
+        tranches,
+        telemetry,
+        sharedMimir,
+        includeSymbiosis: false, // Avoid 429 rate-limit burst across 10 parallel requests
+        includeCrossChainHops: true,
+      })
+    )
+  );
+
+  const allRoutes = [];
+  const mergedHealth = {};
+  const unavailMap = new Map();
+
+  for (const res of results) {
+    allRoutes.push(...res.routes);
+    for (const [k, v] of Object.entries(res.protocolHealth)) {
+      if (!mergedHealth[k] || (mergedHealth[k].state === "unknown" && v.state !== "unknown") || v.state === "ok") {
+        mergedHealth[k] = v;
+      }
+    }
+    for (const u of res.unavailable) {
+      if (!unavailMap.has(u.name)) unavailMap.set(u.name, u);
+    }
+  }
+
+  // Sort globally by highest net BTC received!
+  allRoutes.sort((a, b) => b.totalBtcOut - a.totalBtcOut);
+
   return {
-    routes,
-    unavailable,
-    protocolHealth,
+    routes: allRoutes,
+    unavailable: Array.from(unavailMap.values()),
+    protocolHealth: mergedHealth,
+    scannedPairs: pairs.length,
   };
 }

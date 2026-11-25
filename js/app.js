@@ -1,23 +1,26 @@
 import { CHAINS } from "./config.js";
-import { fetchTelemetry, findBestRoutes } from "./engine.js";
+import { fetchTelemetry, findBestRoutes, findBestRoutesGlobal } from "./engine.js";
+
+const GLOBAL_TOKEN_FILTERS = ["ALL", "WBTC", "cbBTC", "tBTC", "BTC.b", "BTCB", "LBTC", "kBTC"];
 
 const state = {
-  chainId: "arbitrum",
-  tokenSymbol: "WBTC",
-  unit: "USD", // "USD" or "BTC"
-  inputValue: 20000,
+  chainId: "arbitrum", // "all" or any key in CHAINS
+  tokenSymbol: "WBTC", // or "ALL" when chainId === "all"
+  unit: "USD",
   tranches: 1,
-  sortBy: "net", // "net" | "speed" | "steps"
+  sortBy: "net",
   filterNoUsd: false,
+  includeCrossChain: true,
   telemetry: null,
   lastResult: null,
   isLoading: false,
 };
 
-// DOM refs
 const el = {
   chainPills: document.getElementById("chain-pills"),
   tokenPills: document.getElementById("token-pills"),
+  tokenFieldLabel: document.getElementById("token-field-label"),
+  contractBar: document.getElementById("contract-bar"),
   contractAddr: document.getElementById("contract-addr"),
   btnCopyContract: document.getElementById("btn-copy-contract"),
   amountInput: document.getElementById("amount-input"),
@@ -32,14 +35,17 @@ const el = {
   teleSrcPeg: document.getElementById("tele-src-peg"),
   teleMempool: document.getElementById("tele-mempool"),
   teleUpdated: document.getElementById("tele-updated"),
+  resultsHeading: document.getElementById("results-heading"),
   resultsCount: document.getElementById("results-count"),
   winnerBanner: document.getElementById("winner-banner"),
   loadingState: document.getElementById("loading-state"),
+  loadingDetail: document.getElementById("loading-detail"),
   routesList: document.getElementById("routes-list"),
   unavailableSection: document.getElementById("unavailable-section"),
   unavailableCount: document.getElementById("unavailable-count"),
   unavailableList: document.getElementById("unavailable-list"),
   filterNoUsd: document.getElementById("filter-no-usd"),
+  filterCrossChain: document.getElementById("filter-cross-chain"),
 };
 
 function fmtUsd(val) {
@@ -65,9 +71,10 @@ function updateEquivDisplay() {
     el.amountEquiv.textContent = "—";
     return;
   }
+  const symLabel = state.chainId === "all" && state.tokenSymbol === "ALL" ? "BTC sintético" : state.tokenSymbol;
   if (state.unit === "USD") {
     const btc = v / btcPrice;
-    el.amountEquiv.textContent = `≈ ${btc.toFixed(6)} ${state.tokenSymbol}`;
+    el.amountEquiv.textContent = `≈ ${btc.toFixed(6)} ${symLabel}`;
   } else {
     const usd = v * btcPrice;
     el.amountEquiv.textContent = `≈ ${fmtUsd(usd)}`;
@@ -94,6 +101,22 @@ function updateUtxoHint() {
 
 function renderChains() {
   el.chainPills.innerHTML = "";
+
+  // Global "All Chains" button first!
+  const allBtn = document.createElement("button");
+  allBtn.type = "button";
+  allBtn.className = `pill-btn global-pill ${state.chainId === "all" ? "active" : ""}`;
+  allBtn.innerHTML = `🌐 Todas las redes`;
+  allBtn.addEventListener("click", () => {
+    if (state.chainId === "all") return;
+    state.chainId = "all";
+    state.tokenSymbol = "ALL";
+    renderChains();
+    renderTokens();
+    runQuoteSearch();
+  });
+  el.chainPills.appendChild(allBtn);
+
   Object.values(CHAINS).forEach((chain) => {
     const btn = document.createElement("button");
     btn.type = "button";
@@ -115,8 +138,31 @@ function renderChains() {
 }
 
 function renderTokens() {
-  const chain = CHAINS[state.chainId];
   el.tokenPills.innerHTML = "";
+
+  if (state.chainId === "all") {
+    el.tokenFieldLabel.textContent = "2. Filtrar por activo sintético (en todas las redes)";
+    el.contractBar.classList.add("hidden");
+    GLOBAL_TOKEN_FILTERS.forEach((sym) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `pill-btn ${sym === state.tokenSymbol ? "active" : ""}`;
+      btn.textContent = sym === "ALL" ? "✨ Todos los activos" : sym;
+      btn.addEventListener("click", () => {
+        if (state.tokenSymbol === sym) return;
+        state.tokenSymbol = sym;
+        renderTokens();
+        runQuoteSearch();
+      });
+      el.tokenPills.appendChild(btn);
+    });
+    updateEquivDisplay();
+    return;
+  }
+
+  el.tokenFieldLabel.textContent = "2. Activo sintético BTC";
+  el.contractBar.classList.remove("hidden");
+  const chain = CHAINS[state.chainId];
   Object.values(chain.tokens).forEach((tok) => {
     const btn = document.createElement("button");
     btn.type = "button";
@@ -138,8 +184,13 @@ function renderTokens() {
 
 function renderTelemetry(t) {
   el.teleBtcPrice.textContent = t.btcPrice ? fmtUsd(t.btcPrice) : "—";
-  el.teleSrcPeg.textContent = `${state.tokenSymbol} ${fmtPct(t.pegPct)}`;
-  el.teleSrcPeg.className = `tele-value mono ${t.pegPct >= 0.05 ? "pos" : t.pegPct <= -0.2 ? "neg" : ""}`;
+  if (state.chainId === "all") {
+    el.teleSrcPeg.textContent = "Escáner 7 redes";
+    el.teleSrcPeg.className = "tele-value mono pos";
+  } else {
+    el.teleSrcPeg.textContent = `${state.tokenSymbol} ${fmtPct(t.pegPct)}`;
+    el.teleSrcPeg.className = `tele-value mono ${t.pegPct >= 0.05 ? "pos" : t.pegPct <= -0.2 ? "neg" : ""}`;
+  }
   const satVb = t.mempool?.halfHourFee ?? "?";
   const txUsd = t.estBtcTxFeeBtc * t.btcPrice;
   el.teleMempool.textContent = `${satVb} sat/vB (~${fmtUsd(txUsd)})`;
@@ -160,11 +211,19 @@ function renderProtocolHealth(health) {
 
 function renderResults() {
   if (!state.lastResult) return;
-  const { routes, unavailable } = state.lastResult;
+  const { routes, unavailable, scannedPairs } = state.lastResult;
+  const isGlobal = state.chainId === "all";
+
+  el.resultsHeading.textContent = isGlobal
+    ? `Ranking global en todas las redes (${scannedPairs || 0} pares escaneados)`
+    : `Mejores rutas desde ${CHAINS[state.chainId].name} (${state.tokenSymbol})`;
 
   let filtered = [...routes];
   if (state.filterNoUsd) {
     filtered = filtered.filter((r) => !r.usdExposure);
+  }
+  if (!state.includeCrossChain) {
+    filtered = filtered.filter((r) => !r.crossChainHop);
   }
 
   if (state.sortBy === "net") {
@@ -175,17 +234,24 @@ function renderResults() {
     filtered.sort((a, b) => a.stepsCount - b.stepsCount || b.totalBtcOut - a.totalBtcOut);
   }
 
-  el.resultsCount.textContent = `${filtered.length} ruta${filtered.length === 1 ? "" : "s"} activa${filtered.length === 1 ? "" : "s"}`;
+  // Cap global view at top 25 routes so UI stays razor-fast
+  const displayed = isGlobal ? filtered.slice(0, 25) : filtered;
+  el.resultsCount.textContent = isGlobal && filtered.length > 25
+    ? `Mostrando Top 25 de ${filtered.length} rutas activas`
+    : `${displayed.length} ruta${displayed.length === 1 ? "" : "s"} activa${displayed.length === 1 ? "" : "s"}`;
 
   // Winner Banner
-  if (filtered.length > 0) {
-    const best = filtered[0];
+  if (displayed.length > 0) {
+    const best = displayed[0];
     el.winnerBanner.classList.remove("hidden");
     const deltaClass = best.diffPct >= 0 ? "pos" : "neg";
+    const originInfo = isGlobal
+      ? `Origen ganador: <strong>${best.originChainName} (${best.originToken})</strong> · `
+      : "";
     el.winnerBanner.innerHTML = `
       <div>
         <h3>🏆 Mejor opción ahora mismo: ${best.name}</h3>
-        <p>${best.model} · Tiempo estimado: <strong>${best.etaLabel}</strong> · ${best.stepsCount} paso${best.stepsCount > 1 ? "s" : ""} · ${best.usdExposure ? "Con paso breve por USDC" : "0% exposición a USD"}</p>
+        <p>${originInfo}${best.model} · Tiempo: <strong>${best.etaLabel}</strong> · ${best.stepsCount} paso${best.stepsCount > 1 ? "s" : ""} · ${best.usdExposure ? "Paso breve por USDC" : "0% exposición a USD"}</p>
       </div>
       <div class="winner-big">
         <div class="winner-btc mono">${best.totalBtcOut.toFixed(6)} BTC</div>
@@ -196,22 +262,27 @@ function renderResults() {
     el.winnerBanner.classList.add("hidden");
   }
 
-  // Cards
+  // Route Cards
   el.routesList.innerHTML = "";
-  if (filtered.length === 0) {
-    el.routesList.innerHTML = `<div class="panel"><p style="color:var(--text-muted)">No hay rutas activas que cumplan los filtros seleccionados. Prueba desactivando "0% exposición a USD" o cambiando de activo/importe.</p></div>`;
+  if (displayed.length === 0) {
+    el.routesList.innerHTML = `<div class="panel"><p style="color:var(--text-muted)">No hay rutas activas con los filtros actuales. Prueba desactivando «0% exposición a USD» o activando «Incluir saltos de red».</p></div>`;
   }
 
-  filtered.forEach((r, idx) => {
+  displayed.forEach((r, idx) => {
     const rank = idx + 1;
     const card = document.createElement("article");
     card.className = `route-card ${rank === 1 ? "rank-1" : ""}`;
 
     const deltaClass = r.diffPct >= -0.05 ? "pos" : r.diffPct >= -0.35 ? "mid" : "bad";
+    const originBadgeHtml = isGlobal
+      ? `<span class="origin-badge"><span class="chain-dot" style="background:${r.originChainColor}"></span>${r.originChainName} · ${r.originToken}</span>`
+      : "";
+
     const tagsHtml = r.tags
       .map((t) => {
         let cls = "";
-        if (t.includes("0% exposición") || t.includes("solo 9 bps") || t.includes("Fee PLANO")) cls = "green";
+        if (t.includes("Salto a ")) cls = "purple";
+        else if (t.includes("0% exposición") || t.includes("solo 9 bps") || t.includes("Fee PLANO")) cls = "green";
         else if (t.includes("HTLC") || t.includes("Descentralizado")) cls = "blue";
         else if (t.includes("UI oficial")) cls = "btc";
         return `<span class="tag ${cls}">${t}</span>`;
@@ -235,7 +306,7 @@ function renderResults() {
         <div class="route-left">
           <div class="rank-badge">#${rank}</div>
           <div>
-            <div class="route-title">${r.name}</div>
+            <div class="route-title">${originBadgeHtml}<span>${r.name}</span></div>
             <div class="route-tags">
               <span class="tag">${r.model}</span>
               <span class="tag">${r.etaLabel}</span>
@@ -261,7 +332,7 @@ function renderResults() {
     el.routesList.appendChild(card);
   });
 
-  // Unavailable list
+  // Unavailable Drawer
   if (unavailable.length > 0) {
     el.unavailableSection.classList.remove("hidden");
     el.unavailableCount.textContent = String(unavailable.length);
@@ -284,8 +355,11 @@ async function runQuoteSearch() {
   state.isLoading = true;
   el.btnSearch.disabled = true;
   el.btnSearch.classList.add("loading");
-  el.btnSearchText.textContent = "Cotizando...";
+  el.btnSearchText.textContent = state.chainId === "all" ? "Escaneando 7 redes..." : "Cotizando...";
   el.loadingState.classList.remove("hidden");
+  el.loadingDetail.textContent = state.chainId === "all"
+    ? "Escaneando en paralelo Arbitrum, Ethereum, Base, Optimism, Avalanche, Polygon y BNB Chain (incluyendo saltos cross-chain a Base y Ethereum)..."
+    : "Consultando rutas directas y saltos cross-chain (Across → Base / Ethereum, Garden, Threshold, NEAR Intents, THORChain, Chainflip, Symbiosis y Maya)...";
   el.winnerBanner.classList.add("hidden");
 
   try {
@@ -299,13 +373,21 @@ async function runQuoteSearch() {
       throw new Error("Introduce un importe válido mayor que 0.");
     }
 
-    const result = await findBestRoutes({
-      chainId: state.chainId,
-      tokenSymbol: state.tokenSymbol,
-      totalAmountBtc,
-      tranches: state.tranches,
-      telemetry,
-    });
+    const result = state.chainId === "all"
+      ? await findBestRoutesGlobal({
+          tokenFilter: state.tokenSymbol,
+          totalAmountBtc,
+          tranches: state.tranches,
+          telemetry,
+        })
+      : await findBestRoutes({
+          chainId: state.chainId,
+          tokenSymbol: state.tokenSymbol,
+          totalAmountBtc,
+          tranches: state.tranches,
+          telemetry,
+          includeCrossChainHops: true,
+        });
 
     state.lastResult = result;
     renderProtocolHealth(result.protocolHealth);
@@ -322,7 +404,6 @@ async function runQuoteSearch() {
 }
 
 function wireEvents() {
-  // Unit toggle
   document.querySelectorAll(".unit-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       const nextUnit = btn.dataset.unit;
@@ -342,7 +423,6 @@ function wireEvents() {
     });
   });
 
-  // Amount presets
   document.querySelectorAll(".preset-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       const usd = parseFloat(btn.dataset.usd);
@@ -384,11 +464,10 @@ function wireEvents() {
       el.btnCopyContract.textContent = "¡Copiado!";
       setTimeout(() => (el.btnCopyContract.textContent = "Copiar"), 1400);
     } catch {
-      // Fallback ignored
+      // ignore
     }
   });
 
-  // Sort buttons
   document.querySelectorAll(".sort-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       state.sortBy = btn.dataset.sort;
@@ -399,6 +478,11 @@ function wireEvents() {
 
   el.filterNoUsd.addEventListener("change", () => {
     state.filterNoUsd = el.filterNoUsd.checked;
+    renderResults();
+  });
+
+  el.filterCrossChain.addEventListener("change", () => {
+    state.includeCrossChain = el.filterCrossChain.checked;
     renderResults();
   });
 }
